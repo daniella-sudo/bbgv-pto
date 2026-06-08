@@ -65,7 +65,7 @@ exports.handler = async function(event) {
     
     const columnValues = {};
     if (statusCol) {
-      columnValues[statusCol.id] = { labels: ['Pending Approval'] };
+      columnValues[statusCol.id] = { labels: ['Pending'] };
     }
 
     const createResult = await mondayRequest(
