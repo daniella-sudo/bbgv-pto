@@ -40,46 +40,47 @@ exports.handler = async function(event) {
     const apiToken = process.env.MONDAY_API_TOKEN;
     if (!apiToken) throw new Error('MONDAY_API_TOKEN not set');
 
-    // Step 1: Find the board and get group IDs
-    const boardsResult = await mondayRequest('{ boards(limit: 50) { id name groups { id title } } }');
-    console.log('boards result:', JSON.stringify(boardsResult).substring(0, 800));
+    // Step 1: Find the board, groups and columns
+    const boardsResult = await mondayRequest('{ boards(limit: 50) { id name groups { id title } columns { id title type } } }');
 
     const boards = boardsResult.data?.boards || [];
     const board = boards.find(b => b.name === 'Calendar of Team Events');
-    if (!board) {
-      throw new Error('Board not found. Available: ' + boards.map(b => b.name).join(', '));
-    }
-    console.log('Found board:', board.id, board.name);
+    if (!board) throw new Error('Board not found. Available: ' + boards.map(b => b.name).join(', '));
+    console.log('Found board:', board.id);
 
     // Step 2: Find the group
-    const groups = board.groups || [];
-    console.log('Groups:', JSON.stringify(groups));
-    const group = groups.find(g => g.title.toLowerCase().includes('personal pto') || g.title.toLowerCase().includes('office closed'));
-    if (!group) {
-      throw new Error('Group not found. Available groups: ' + groups.map(g => g.title).join(', '));
-    }
+    const group = board.groups.find(g => g.title.toLowerCase().includes('personal pto') || g.title.toLowerCase().includes('office closed'));
+    if (!group) throw new Error('Group not found. Available: ' + board.groups.map(g => g.title).join(', '));
     console.log('Found group:', group.id, group.title);
 
-    // Step 3: Create the item
+    // Step 3: Log all columns so we can see their IDs
+    console.log('Columns:', JSON.stringify(board.columns));
+
+    // Step 4: Find the status column (named "Approved?")
+    const statusCol = board.columns.find(c => c.title === 'Approved?' || c.type === 'status');
+    console.log('Status column:', JSON.stringify(statusCol));
+
+    // Step 5: Create the item
     const itemName = name + ' - ' + type + ' (' + start + (start !== end ? ' to ' + end : '') + ')';
+    
+    const columnValues = {};
+    if (statusCol) {
+      columnValues[statusCol.id] = { label: 'Pending Approval' };
+    }
+
     const createResult = await mondayRequest(
       'mutation($boardId: ID!, $groupId: String!, $itemName: String!, $columnValues: JSON!) { create_item(board_id: $boardId, group_id: $groupId, item_name: $itemName, column_values: $columnValues) { id name } }',
       {
         boardId: board.id,
         groupId: group.id,
         itemName: itemName,
-        columnValues: JSON.stringify({
-          status: { label: 'Pending Approval' },
-          text: 'PTO Request ID: ' + requestId + ' | Submitted: ' + new Date().toLocaleDateString() + ' | Approve: ' + approveUrl + ' | Reject: ' + rejectUrl
-        })
+        columnValues: JSON.stringify(columnValues)
       }
     );
 
-    console.log('create result:', JSON.stringify(createResult).substring(0, 500));
+    if (createResult.errors) throw new Error('Monday error: ' + JSON.stringify(createResult.errors));
 
-    if (createResult.errors) {
-      throw new Error('Monday error: ' + JSON.stringify(createResult.errors));
-    }
+    console.log('Created item:', createResult.data?.create_item?.id);
 
     return {
       statusCode: 200,
