@@ -1,29 +1,26 @@
 const https = require('https');
 
-function callClaude(prompt, mcpServers) {
+function mondayRequest(query, variables) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      mcp_servers: mcpServers,
-      messages: [{ role: 'user', content: prompt }]
-    });
+    const body = JSON.stringify({ query, variables });
     const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
+      hostname: 'api.monday.com',
+      path: '/v2',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': 'mcp-client-2025-04-04',
+        'Authorization': process.env.MONDAY_API_TOKEN,
+        'API-Version': '2024-01',
         'Content-Length': Buffer.byteLength(body)
       }
     };
     const req = https.request(options, res => {
       let d = '';
       res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch { reject(new Error('Parse error')); } });
+      res.on('end', () => {
+        try { resolve(JSON.parse(d)); }
+        catch { reject(new Error('Monday parse error: ' + d)); }
+      });
     });
     req.on('error', reject);
     req.write(body);
@@ -35,36 +32,57 @@ exports.handler = async function(event) {
   if (event.httpMethod !== 'POST') {
     return { statusCode: 405, body: JSON.stringify({ error: 'Method not allowed' }) };
   }
+
   try {
     const { requestId, name, start, end, type, location, notes, approveUrl, rejectUrl } = JSON.parse(event.body);
     console.log('submit-pto:', name, start, end);
 
-    const formatDate = d => new Date(d+'T00:00:00').toLocaleDateString('en-US',{weekday:'short',month:'long',day:'numeric',year:'numeric'});
-    const dateRange = start===end ? formatDate(start) : formatDate(start) + ' - ' + formatDate(end);
+    const apiToken = process.env.MONDAY_API_TOKEN;
+    if (!apiToken) throw new Error('MONDAY_API_TOKEN not set');
 
-    const slackPrompt = 'Send a Slack direct message to both Nisha Dua and Susan Lyne with this message:\n\n*New PTO Request - Approval Needed*\n*Who:* ' + name + '\n*Dates:* ' + dateRange + '\n*Type:* ' + type + (location ? '\n*Location:* ' + location : '') + (notes ? '\n*Notes:* ' + notes : '') + '\n\nApprove: ' + approveUrl + '\nReject: ' + rejectUrl + '\n\nAny one partner can approve.';
+    // Step 1: Find the board ID
+    const boardsResult = await mondayRequest('{ boards(limit: 50) { id name } }');
+    console.log('boards result:', JSON.stringify(boardsResult).substring(0, 500));
 
-    const mondayPrompt = 'Create an item on the Monday.com board called "Personal PTO/ Office Closed":\n- Name: ' + name + '\n- Dates: ' + start + ' to ' + end + '\n- Status: Pending Approval\n- Location: ' + (location || 'N/A') + '\n- Notes: ' + (notes || '') + '\n- Information: PTO Request ID: ' + requestId + ' | Submitted: ' + new Date().toLocaleDateString() + ' | Awaiting approval';
+    const boards = boardsResult.data?.boards || [];
+    const board = boards.find(b => b.name === 'Personal PTO/ Office Closed');
+    if (!board) {
+      throw new Error('Board not found. Available: ' + boards.map(b => b.name).join(', '));
+    }
+    console.log('Found board:', board.id, board.name);
 
-    const emailPrompt = 'Send two emails:\n1. To nisha@bbgv.com, Subject: "PTO Approval Needed: ' + name + ' - ' + dateRange + '", Body: Hi Nisha, ' + name + ' submitted a PTO request for ' + dateRange + ' (' + type + '). Approve: ' + approveUrl + ' Reject: ' + rejectUrl + '. Thanks, BBGV PTO Tracker\n2. To susan@bbgv.com, Subject: "PTO Approval Needed: ' + name + ' - ' + dateRange + '", Body: Hi Susan, ' + name + ' submitted a PTO request for ' + dateRange + ' (' + type + '). Approve: ' + approveUrl + ' Reject: ' + rejectUrl + '. Thanks, BBGV PTO Tracker';
+    // Step 2: Create the item
+    const itemName = name + ' - ' + type + ' (' + start + (start !== end ? ' to ' + end : '') + ')';
+    const createResult = await mondayRequest(
+      'mutation($boardId: ID!, $itemName: String!, $columnValues: JSON!) { create_item(board_id: $boardId, item_name: $itemName, column_values: $columnValues) { id name } }',
+      {
+        boardId: board.id,
+        itemName: itemName,
+        columnValues: JSON.stringify({
+          status: { label: 'Pending Approval' },
+          text: 'PTO Request ID: ' + requestId + ' | Submitted: ' + new Date().toLocaleDateString() + ' | Approve: ' + approveUrl + ' | Reject: ' + rejectUrl
+        })
+      }
+    );
 
-    const [slackRes, mondayRes, emailRes] = await Promise.allSettled([
-      callClaude(slackPrompt, [{ type: 'url', url: 'https://mcp.slack.com/mcp', name: 'slack' }]),
-      callClaude(mondayPrompt, [{ type: 'url', url: 'https://mcp.monday.com/mcp', name: 'monday' }]),
-      callClaude(emailPrompt, [{ type: 'url', url: 'https://gmailmcp.googleapis.com/mcp/v1', name: 'gmail' }])
-    ]);
+    console.log('create result:', JSON.stringify(createResult).substring(0, 500));
 
-    console.log('slack:', slackRes.status);
-    console.log('monday:', mondayRes.status);
-    console.log('email:', emailRes.status);
+    if (createResult.errors) {
+      throw new Error('Monday error: ' + JSON.stringify(createResult.errors));
+    }
 
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ success: true, slack: slackRes.status, monday: mondayRes.status, email: emailRes.status })
+      body: JSON.stringify({ success: true, requestId, mondayItemId: createResult.data?.create_item?.id })
     };
+
   } catch(err) {
-    console.error('Error:', err.message);
-    return { statusCode: 500, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: err.message }) };
+    console.error('submit-pto error:', err.message);
+    return {
+      statusCode: 500,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ error: err.message })
+    };
   }
 };
