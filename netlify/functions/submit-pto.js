@@ -45,7 +45,7 @@ exports.handler = async function(event) {
     console.log('boards result:', JSON.stringify(boardsResult).substring(0, 500));
 
     const boards = boardsResult.data?.boards || [];
-    const board = boards.find(b => b.name === 'Personal PTO/ Office Closed');
+    const board = boards.find(b => b.name.toLowerCase().includes('personal pto'));
     if (!board) {
       throw new Error('Board not found. Available: ' + boards.map(b => b.name).join(', '));
     }
